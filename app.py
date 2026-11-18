@@ -361,7 +361,13 @@ def leer_plano(archivo_bytes, tipo_archivo, api_key):
         max_tokens=4000,
         messages=[{"role": "user", "content": [bloque, {"type": "text", "text": INSTRUCCION_PLANO}]}],
     )
-    return limpiar_json(respuesta.content[0].text)
+    texto = ""
+    for bloque_respuesta in respuesta.content:
+        if getattr(bloque_respuesta, "type", "") == "text":
+            texto = texto + bloque_respuesta.text
+    if not texto:
+        raise ValueError("La IA no devolvió texto. Intente de nuevo.")
+    return limpiar_json(texto)
 
 
 def normalizar_resultado(resultado, altura):
