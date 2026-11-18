@@ -3,7 +3,9 @@
 #  Programación Digital CIV-601 · Ingeniería Civil · UCSUR
 # =============================================================================
 
+import base64
 import io
+import json
 import math
 
 import matplotlib
@@ -305,6 +307,81 @@ def generar_pdf(lineas, figuras):
 
 
 # =============================================================================
+# PARTE 8 · LECTURA DE PLANOS CON IA
+# =============================================================================
+INSTRUCCION_PLANO = """Eres un asistente de metrados de albañilería. Analiza este plano de
+planta arquitectónica (vista superior) y extrae los muros de ladrillo.
+
+Reglas:
+- Usa SOLO las cotas escritas en el plano (en metros). No midas a escala.
+- Lista los muros exteriores (perímetro) uno por uno, y los muros interiores
+  que separan ambientes, indicando entre qué ambientes están.
+- Para cada muro indica su largo en metros.
+- Indica las puertas y ventanas de cada muro. Si el plano no indica su medida,
+  usa: puerta principal 0.90 x 2.10 m, puerta interior 0.80 x 2.10 m,
+  puerta de baño 0.70 x 2.10 m, ventana 1.20 x 1.00 m, y márcalo en "notas".
+- No inventes muros que no veas. Si algo no es legible, dilo en "notas".
+
+Responde SOLO con JSON válido, sin texto adicional, con este formato:
+{"muros": [{"nombre": "Muro exterior norte", "largo": 7.00,
+            "aberturas": [{"tipo": "Puerta", "ancho": 0.90, "alto": 2.10, "cantidad": 1}]}],
+ "notas": ["supuestos y advertencias"]}"""
+
+
+def obtener_api_key(clave_manual):
+    if clave_manual:
+        return clave_manual
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return ""
+
+
+def limpiar_json(texto):
+    texto = texto.strip()
+    if texto.startswith("```"):
+        texto = texto.split("\n", 1)[1]
+        texto = texto.rsplit("```", 1)[0]
+    inicio, fin = texto.find("{"), texto.rfind("}")
+    return json.loads(texto[inicio:fin + 1])
+
+
+def leer_plano(archivo_bytes, tipo_archivo, api_key):
+    import anthropic
+    datos = base64.b64encode(archivo_bytes).decode()
+    if tipo_archivo == "application/pdf":
+        bloque = {"type": "document", "source": {"type": "base64",
+                  "media_type": "application/pdf", "data": datos}}
+    else:
+        bloque = {"type": "image", "source": {"type": "base64",
+                  "media_type": tipo_archivo, "data": datos}}
+    cliente = anthropic.Anthropic(api_key=api_key)
+    respuesta = cliente.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=4000,
+        messages=[{"role": "user", "content": [bloque, {"type": "text", "text": INSTRUCCION_PLANO}]}],
+    )
+    return limpiar_json(respuesta.content[0].text)
+
+
+def normalizar_resultado(resultado, altura):
+    muros = []
+    for m in resultado.get("muros", []):
+        largo = float(m.get("largo", 0) or 0)
+        if largo <= 0:
+            continue
+        aberturas = []
+        for a in m.get("aberturas", []):
+            tipo = "Puerta" if str(a.get("tipo", "")).lower().startswith("p") else "Ventana"
+            aberturas.append({"tipo": tipo, "ancho": float(a.get("ancho", 0) or 0),
+                              "alto": float(a.get("alto", 0) or 0),
+                              "cantidad": int(a.get("cantidad", 1) or 1)})
+        muros.append({"nombre": str(m.get("nombre", f"Muro {len(muros) + 1}")),
+                      "largo": round(largo, 2), "alto": altura, "aberturas": aberturas})
+    return muros, resultado.get("notas", [])
+
+
+# =============================================================================
 # PARTE 7 · INTERFAZ WEB
 # =============================================================================
 st.set_page_config(page_title="Calculadora de Muros · UCSUR", page_icon="🧱", layout="wide")
@@ -342,20 +419,77 @@ paso1, paso2, paso3, paso4, paso5 = st.tabs(
 
 # ---- 7.2 Muros y aberturas ----
 with paso1:
-    n_muros = st.number_input("¿Cuántos muros tiene la obra?", 1, 20, 1, 1)
+    if "plano_muros" not in st.session_state:
+        st.session_state["plano_muros"] = []
+        st.session_state["plano_notas"] = []
+        st.session_state["plano_version"] = 0
+
+    with st.expander("📐 Leer muros desde un plano con IA", expanded=False):
+        st.markdown("Suba un plano de planta (vista superior) con las cotas visibles. "
+                    "La IA lee los muros y aberturas y llena la tabla; **revise los datos antes de calcular**.")
+        c1, c2 = st.columns([2, 1])
+        archivo = c1.file_uploader("Plano (PNG, JPG o PDF)", type=["png", "jpg", "jpeg", "pdf"])
+        altura_plano = c2.number_input("Altura de los muros (m)", 2.0, 6.0, 2.60, 0.05)
+        clave_manual = c2.text_input("API key (si no está en Secrets)", type="password")
+        if archivo is not None and archivo.type != "application/pdf":
+            st.image(archivo, caption="Plano subido", width=420)
+        if st.button("🤖 Leer plano", disabled=archivo is None):
+            api_key = obtener_api_key(clave_manual)
+            if not api_key:
+                st.error("Falta la API key. Agréguela en Settings → Secrets de Streamlit "
+                         "como ANTHROPIC_API_KEY o escríbala arriba.")
+            else:
+                with st.spinner("Leyendo el plano..."):
+                    try:
+                        tipo = "image/jpeg" if archivo.type in ("image/jpg", "image/jpeg") else archivo.type
+                        resultado = leer_plano(archivo.getvalue(), tipo, api_key)
+                        muros_ia, notas_ia = normalizar_resultado(resultado, altura_plano)
+                        if muros_ia:
+                            st.session_state["plano_muros"] = muros_ia
+                            st.session_state["plano_notas"] = notas_ia
+                            st.session_state["plano_version"] += 1
+                            st.rerun()
+                        else:
+                            st.warning("No se pudieron identificar muros en el plano.")
+                    except Exception as e:
+                        st.error(f"No se pudo leer el plano: {e}")
+        if st.session_state["plano_muros"]:
+            st.success(f"Se leyeron {len(st.session_state['plano_muros'])} muros del plano. "
+                       "Revise cada pestaña.")
+            for nota in st.session_state["plano_notas"]:
+                st.info(nota)
+            if st.button("🗑️ Descartar datos del plano"):
+                st.session_state["plano_muros"] = []
+                st.session_state["plano_notas"] = []
+                st.session_state["plano_version"] += 1
+                st.rerun()
+
+    desde_plano = st.session_state["plano_muros"]
+    ver = st.session_state["plano_version"]
+    n_inicial = len(desde_plano) if desde_plano else 1
+    n_muros = st.number_input("¿Cuántos muros tiene la obra?", 1, 40, n_inicial, 1, key=f"n{ver}")
     muros = []
     errores_muros = []
     pestañas = st.tabs([f"Muro {i + 1}" for i in range(int(n_muros))])
     for i in range(int(n_muros)):
         with pestañas[i]:
+            base = desde_plano[i] if i < len(desde_plano) else None
+            if base:
+                st.caption(f"📐 Del plano: {base['nombre']}")
             c1, c2 = st.columns(2)
-            largo = c1.number_input("Largo (m)", 0.1, 100.0, 5.0, 0.05, key=f"l{i}")
-            alto = c2.number_input("Alto (m)", 0.1, 10.0, 2.6, 0.05, key=f"h{i}")
+            largo = c1.number_input("Largo (m)", 0.1, 100.0, base["largo"] if base else 5.0, 0.05,
+                                    key=f"l{i}_{ver}")
+            alto = c2.number_input("Alto (m)", 0.1, 10.0, base["alto"] if base else 2.6, 0.05,
+                                   key=f"h{i}_{ver}")
             st.markdown("**Puertas y ventanas** (agregue filas con ➕)")
-            inicial = pd.DataFrame([{"tipo": "Puerta", "ancho": 0.90, "alto": 2.10, "cantidad": 1}]) \
-                if i == 0 else pd.DataFrame(columns=["tipo", "ancho", "alto", "cantidad"])
+            if base:
+                inicial = pd.DataFrame(base["aberturas"], columns=["tipo", "ancho", "alto", "cantidad"])
+            elif i == 0:
+                inicial = pd.DataFrame([{"tipo": "Puerta", "ancho": 0.90, "alto": 2.10, "cantidad": 1}])
+            else:
+                inicial = pd.DataFrame(columns=["tipo", "ancho", "alto", "cantidad"])
             tabla = st.data_editor(
-                inicial, num_rows="dynamic", key=f"ab{i}", width="stretch",
+                inicial, num_rows="dynamic", key=f"ab{i}_{ver}", width="stretch",
                 column_config={
                     "tipo": st.column_config.SelectboxColumn("Tipo", options=["Puerta", "Ventana"], required=True),
                     "ancho": st.column_config.NumberColumn("Ancho (m)", min_value=0.0, step=0.05),
@@ -379,7 +513,7 @@ with paso1:
             k1.metric("Área bruta", f"{bruta:.2f} m²")
             k2.metric("Aberturas", f"{ab:.2f} m²")
             k3.metric("Área neta", f"{neta:.2f} m²")
-            muros.append({"nombre": f"Muro {i + 1}", "largo": largo, "alto": alto, "aberturas": aberturas,
+            muros.append({"nombre": base["nombre"] if base else f"Muro {i + 1}", "largo": largo, "alto": alto, "aberturas": aberturas,
                           "area_bruta": bruta, "area_ab": ab, "area_neta": neta})
 
 # ---- 7.3 Unidad de albañilería ----
