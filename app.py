@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import math
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -322,10 +323,7 @@ Reglas:
   puerta de baño 0.70 x 2.10 m, ventana 1.20 x 1.00 m, y márcalo en "notas".
 - No inventes muros que no veas. Si algo no es legible, dilo en "notas".
 
-Responde SOLO con JSON válido, sin texto adicional, con este formato:
-{"muros": [{"nombre": "Muro exterior norte", "largo": 7.00,
-            "aberturas": [{"tipo": "Puerta", "ancho": 0.90, "alto": 2.10, "cantidad": 1}]}],
- "notas": ["supuestos y advertencias"]}"""
+- En "notas" escribe los supuestos y advertencias, en español."""
 
 
 def obtener_api_key(clave_manual):
@@ -337,13 +335,52 @@ def obtener_api_key(clave_manual):
         return ""
 
 
+HERRAMIENTA_MUROS = {
+    "name": "registrar_muros",
+    "description": "Registra los muros, puertas y ventanas leídos del plano.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "muros": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "nombre": {"type": "string"},
+                        "largo": {"type": "number"},
+                        "aberturas": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tipo": {"type": "string", "enum": ["Puerta", "Ventana"]},
+                                    "ancho": {"type": "number"},
+                                    "alto": {"type": "number"},
+                                    "cantidad": {"type": "integer"},
+                                },
+                                "required": ["tipo", "ancho", "alto", "cantidad"],
+                            },
+                        },
+                    },
+                    "required": ["nombre", "largo", "aberturas"],
+                },
+            },
+            "notas": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["muros", "notas"],
+    },
+}
+
+
 def limpiar_json(texto):
     texto = texto.strip()
     if texto.startswith("```"):
         texto = texto.split("\n", 1)[1]
         texto = texto.rsplit("```", 1)[0]
     inicio, fin = texto.find("{"), texto.rfind("}")
-    return json.loads(texto[inicio:fin + 1])
+    texto = texto[inicio:fin + 1]
+    texto = re.sub(r",\s*([}\]])", r"\1", texto)
+    return json.loads(texto)
 
 
 def leer_plano(archivo_bytes, tipo_archivo, api_key):
@@ -358,15 +395,25 @@ def leer_plano(archivo_bytes, tipo_archivo, api_key):
     cliente = anthropic.Anthropic(api_key=api_key)
     respuesta = cliente.messages.create(
         model="claude-sonnet-5-5",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": [bloque, {"type": "text", "text": INSTRUCCION_PLANO}]}],
+        max_tokens=16000,
+        tools=[HERRAMIENTA_MUROS],
+        tool_choice={"type": "auto"},
+        messages=[{"role": "user", "content": [
+            bloque,
+            {"type": "text", "text": INSTRUCCION_PLANO +
+             "\n\nEntrega el resultado llamando a la herramienta registrar_muros."}]}],
     )
+    for parte in respuesta.content:
+        if getattr(parte, "type", "") == "tool_use":
+            return parte.input
+    if respuesta.stop_reason == "max_tokens":
+        raise ValueError("La respuesta de la IA fue demasiado larga. Intente con un plano más simple.")
     texto = ""
-    for bloque_respuesta in respuesta.content:
-        if getattr(bloque_respuesta, "type", "") == "text":
-            texto = texto + bloque_respuesta.text
+    for parte in respuesta.content:
+        if getattr(parte, "type", "") == "text":
+            texto = texto + parte.text
     if not texto:
-        raise ValueError("La IA no devolvió texto. Intente de nuevo.")
+        raise ValueError("La IA no devolvió datos. Intente de nuevo.")
     return limpiar_json(texto)
 
 
